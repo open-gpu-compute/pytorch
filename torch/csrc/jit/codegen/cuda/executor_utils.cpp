@@ -291,7 +291,7 @@ NvrtcFunction nvrtcCompile(
   // int disable_fma_flag = disable_fma ? atoi(disable_fma) : 0;
   if (disable_fma && atoi(disable_fma)) {
 #ifdef __HIP_PLATFORM_HCC__
-    args.push_back("-ffp-contract=off");
+    TORCH_WARN_ONCE("PYTORCH_CUDA_FUSER_DISABLE_FMA is not supported on ROCm, ignoring");
 #else
     args.push_back("--fmad=false");
 #endif
