@@ -1,8 +1,8 @@
 #include <ATen/CUDAGeneratorImpl.h>
-#include <ATen/cuda/CUDAContext.h>
-#include <ATen/cuda/nvrtc_stub/ATenNVRTC.h>
+#include <ATen/hip/HIPContext.h>
+#include <ATen/hip/nvrtc_stub/ATenNVRTC.h>
 
-#include <c10/cuda/CUDACachingAllocator.h>
+#include <ATen/hip/impl/HIPCachingAllocatorMasqueradingAsCUDA.h>
 
 #include <torch/csrc/jit/codegen/cuda/executor_utils.h>
 #include <torch/csrc/jit/codegen/cuda/instrumentation.h>
@@ -251,12 +251,12 @@ NvrtcFunction nvrtcCompile(
   FUSER_PERF_SCOPE("NVRTC");
 
   // lazily construct context if non-existing yet;
-  CUcontext pctx = nullptr;
-  AT_CUDA_DRIVER_CHECK(at::globalContext().getNVRTC().cuCtxGetCurrent(&pctx));
+  hipCtx_t pctx = nullptr;
+  AT_CUDA_DRIVER_CHECK(at::globalContext().getNVRTC().hipCtxGetCurrent(&pctx));
   if (!pctx) {
     std::unique_lock<std::mutex> cudaFreeMutexLock(
-        *(c10::cuda::CUDACachingAllocator::getFreeMutex()));
-    cudaFree(nullptr);
+        *(c10::hip::HIPCachingAllocator::getFreeMutex()));
+    hipFree(nullptr);
   }
 
   const auto prop = at::cuda::getCurrentDeviceProperties();
@@ -264,18 +264,18 @@ NvrtcFunction nvrtcCompile(
   int major = 0, minor = 0;
   getMajorMinor(prop, major, minor);
 
-  nvrtcProgram program; // NOLINT(cppcoreguidelines-init-variables)
+  hiprtcProgram program; // NOLINT(cppcoreguidelines-init-variables)
 
   {
-    FUSER_PERF_SCOPE("nvrtcCreateProgram");
-    AT_CUDA_NVRTC_CHECK(at::globalContext().getNVRTC().nvrtcCreateProgram(
+    FUSER_PERF_SCOPE("hiprtcCreateProgram");
+    AT_CUDA_NVRTC_CHECK(at::globalContext().getNVRTC().hiprtcCreateProgram(
         &program, code.c_str(), nullptr, 0, nullptr, nullptr));
   }
 
   ResourceGuard holdProgram([&] {
-    FUSER_PERF_SCOPE("nvrtcDestroyProgram");
+    FUSER_PERF_SCOPE("hiprtcDestroyProgram");
     AT_CUDA_NVRTC_CHECK(
-        at::globalContext().getNVRTC().nvrtcDestroyProgram(&program));
+        at::globalContext().getNVRTC().hiprtcDestroyProgram(&program));
   });
 
 #ifdef __HIP_PLATFORM_HCC__
@@ -291,7 +291,7 @@ NvrtcFunction nvrtcCompile(
   // int disable_fma_flag = disable_fma ? atoi(disable_fma) : 0;
   if (disable_fma && atoi(disable_fma)) {
 #ifdef __HIP_PLATFORM_HCC__
-    args.push_back("-ffp-contract=off");
+    TORCH_WARN_ONCE("PYTORCH_CUDA_FUSER_DISABLE_FMA is not supported on ROCm, ignoring");
 #else
     args.push_back("--fmad=false");
 #endif
@@ -300,14 +300,14 @@ NvrtcFunction nvrtcCompile(
   const char* ptxas_opt_level = getenv("PYTORCH_CUDA_FUSER_JIT_OPT_LEVEL");
   uint32_t jit_opt_level;
 
-  std::vector<CUjit_option> options;
+  std::vector<hipJitOption> options;
   std::vector<void*> option_vals;
 
   if (ptxas_opt_level) {
     int val = atoi(ptxas_opt_level);
     if (val <= 4 && val >= 0) {
       jit_opt_level = static_cast<uint32_t>(val);
-      options.push_back(CU_JIT_OPTIMIZATION_LEVEL);
+      options.push_back(hipJitOptionOptimizationLevel);
       option_vals.emplace_back(&jit_opt_level);
     } else {
       TORCH_WARN_ONCE(
@@ -317,20 +317,20 @@ NvrtcFunction nvrtcCompile(
     }
   }
 
-  at::globalContext().getNVRTC().nvrtcAddNameExpression(
+  at::globalContext().getNVRTC().hiprtcAddNameExpression(
       program, func_name.c_str());
 
   {
-    FUSER_PERF_SCOPE("nvrtcCompileProgram");
+    FUSER_PERF_SCOPE("hiprtcCompileProgram");
 
-    const auto result = at::globalContext().getNVRTC().nvrtcCompileProgram(
+    const auto result = at::globalContext().getNVRTC().hiprtcCompileProgram(
         program, args.size(), args.data());
 
-    if (result != NVRTC_SUCCESS) {
+    if (result != HIPRTC_SUCCESS) {
       size_t logsize;
-      at::globalContext().getNVRTC().nvrtcGetProgramLogSize(program, &logsize);
+      at::globalContext().getNVRTC().hiprtcGetProgramLogSize(program, &logsize);
       std::vector<char> log(logsize);
-      at::globalContext().getNVRTC().nvrtcGetProgramLog(program, log.data());
+      at::globalContext().getNVRTC().hiprtcGetProgramLog(program, log.data());
 
       TORCH_INTERNAL_ASSERT(
           false, code.c_str(), "\nCUDA NVRTC compile error: ", log.data());
@@ -340,7 +340,7 @@ NvrtcFunction nvrtcCompile(
   }
 
   const char* lowered_kernel_name = nullptr;
-  at::globalContext().getNVRTC().nvrtcGetLoweredName(
+  at::globalContext().getNVRTC().hiprtcGetLoweredName(
       program, func_name.c_str(), &lowered_kernel_name);
 
   size_t ptx_size = 0;
@@ -349,10 +349,10 @@ NvrtcFunction nvrtcCompile(
   {
     FUSER_PERF_SCOPE("get PTX");
     AT_CUDA_NVRTC_CHECK(
-        at::globalContext().getNVRTC().nvrtcGetPTXSize(program, &ptx_size));
+        at::globalContext().getNVRTC().hiprtcGetCodeSize(program, &ptx_size));
     ptx.resize(ptx_size);
     AT_CUDA_NVRTC_CHECK(
-        at::globalContext().getNVRTC().nvrtcGetPTX(program, ptx.data()));
+        at::globalContext().getNVRTC().hiprtcGetCode(program, ptx.data()));
   }
 
   NvrtcFunction compiled_kernel_;
@@ -375,12 +375,12 @@ NvrtcFunction nvrtcCompile(
 
     CUlinkState linkState;
 
-    AT_CUDA_DRIVER_CHECK(at::globalContext().getNVRTC().cuLinkCreate(
+    AT_CUDA_DRIVER_CHECK(at::globalContext().getNVRTC().hipLinkCreate(
         0, nullptr, nullptr, &linkState));
 
-    AT_CUDA_DRIVER_CHECK(at::globalContext().getNVRTC().cuLinkAddData(
+    AT_CUDA_DRIVER_CHECK(at::globalContext().getNVRTC().hipLinkAddData(
         linkState,
-        CU_JIT_INPUT_PTX,
+        hipJitInputTypePtx,
         ptx.data(),
         ptx_size,
         "compiling PTX",
@@ -390,7 +390,7 @@ NvrtcFunction nvrtcCompile(
 
     size_t cubinSize;
     void* cubin;
-    AT_CUDA_DRIVER_CHECK(at::globalContext().getNVRTC().cuLinkComplete(
+    AT_CUDA_DRIVER_CHECK(at::globalContext().getNVRTC().hipLinkComplete(
         linkState, &cubin, &cubinSize));
 
     // Output binary file
@@ -405,13 +405,13 @@ NvrtcFunction nvrtcCompile(
       myCubinFile.close();
     }
     // load compiled cubin
-    AT_CUDA_DRIVER_CHECK(at::globalContext().getNVRTC().cuModuleLoadData(
+    AT_CUDA_DRIVER_CHECK(at::globalContext().getNVRTC().hipModuleLoadData(
         &(compiled_kernel_.module), cubin));
   } else {
     FUSER_PERF_SCOPE("load PTX");
 
     // load ptx directly
-    AT_CUDA_DRIVER_CHECK(at::globalContext().getNVRTC().cuModuleLoadDataEx(
+    AT_CUDA_DRIVER_CHECK(at::globalContext().getNVRTC().hipModuleLoadDataEx(
         &(compiled_kernel_.module),
         ptx.data(),
         options.size(),
@@ -420,11 +420,11 @@ NvrtcFunction nvrtcCompile(
   }
 #else
   // load ptx directly
-  AT_CUDA_DRIVER_CHECK(at::globalContext().getNVRTC().cuModuleLoadData(
+  AT_CUDA_DRIVER_CHECK(at::globalContext().getNVRTC().hipModuleLoadData(
       &(compiled_kernel_.module), ptx.data()));
 
 #endif
-  AT_CUDA_DRIVER_CHECK(at::globalContext().getNVRTC().cuModuleGetFunction(
+  AT_CUDA_DRIVER_CHECK(at::globalContext().getNVRTC().hipModuleGetFunction(
       &(compiled_kernel_.function),
       compiled_kernel_.module,
       lowered_kernel_name));
