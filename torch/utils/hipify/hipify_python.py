@@ -556,7 +556,7 @@ def get_hip_file_path(filepath, is_pytorch_extension=False):
     # naming conventions.
 
     if ext == '.cu':
-        ext = '.hip'
+        ext = '.hip.cu'
 
     orig_filename = filename
     orig_dirpath = dirpath
@@ -796,7 +796,7 @@ def preprocessor(
     if filepath.endswith('CMakeLists.txt'):
         output_source = output_source.replace('CUDA', 'HIP')
         output_source = output_source.replace('THC', 'THH')
-        output_source = RE_CU_SUFFIX.sub('.hip', output_source)
+        output_source = RE_CU_SUFFIX.sub('.hip.cu', output_source)
 
     # Perform Kernel Launch Replacements
     if not hip_clang_launch:
